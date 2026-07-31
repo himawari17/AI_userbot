@@ -16,6 +16,7 @@ from memory import (
     append_chat_history,
     build_author_label,
     build_model_prompt,
+    format_chat_context,
     load_participant_memory,
     load_recent_chat_history,
     remember_participant,
@@ -33,6 +34,7 @@ RANDOM_REPLY_CHANCE = float(os.getenv("RANDOM_REPLY_CHANCE", "0.3"))
 PARTICIPANT_MEMORY_FILE = Path(os.getenv("PARTICIPANT_MEMORY_FILE", "data/participant_memory.json"))
 CHAT_HISTORY_DIR = Path(os.getenv("CHAT_HISTORY_DIR", "data/chat_history"))
 CHAT_CONTEXT_MESSAGES = 20
+HISTORY_SNAPSHOT_FILE = Path("history.txt")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 GEMENI_MODEL = "models/gemini-3.5-flash-lite"
@@ -161,6 +163,7 @@ async def generate_reply(chat_id: int, user_text: str) -> str:
     recent_history = load_recent_chat_history(
         CHAT_HISTORY_DIR, chat_id, limit=CHAT_CONTEXT_MESSAGES
     )
+    HISTORY_SNAPSHOT_FILE.write_text(format_chat_context(recent_history), encoding="utf-8")
     prompt = build_model_prompt(recent_history, user_text)
     try:
         response = await model.generate_content_async(prompt)
