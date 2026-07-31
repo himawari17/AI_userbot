@@ -21,6 +21,7 @@ I was using AI while creating this project, it may contain (should not) security
     GOOGLE_API_KEY=google_ai_key
     BOT_USERNAME=your_telegram_username
     RANDOM_REPLY_CHANCE=0.3
+    CHAT_ID=chat_id_form_get_groups_id.py
     SYSTEM_PROMPT_FILE=prompt.txt
     ```
     
