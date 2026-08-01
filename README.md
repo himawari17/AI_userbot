@@ -21,8 +21,10 @@ I was using AI while creating this project, it may contain (should not) security
     GOOGLE_API_KEY=google_ai_key
     BOT_USERNAME=your_telegram_username
     RANDOM_REPLY_CHANCE=0.3
+    REPLY_DEBOUNCE_SECONDS=2
     CHAT_ID=chat_id_form_get_groups_id.py
     SYSTEM_PROMPT_FILE=prompt.txt
+    MEMORY_MODEL=models/gemini-2.5-flash-lite
     ```
     
     Project itself already contains `.env_example`.
@@ -48,4 +50,5 @@ I was using AI while creating this project, it may contain (should not) security
 At this moment, programm is focused on Gemini (because it gives you 500 requests per day).
 The model provider layer is designed so that support for other APIs can be added in the future.
 
-
+Participant profiles are stored in `data/participant_memory.json`. Every 10 incoming messages,
+`MEMORY_MODEL` refreshes the participant summary used in later replies.

@@ -3,6 +3,7 @@ import re
 import random
 import asyncio
 import logging
+from typing import TypedDict
 
 import qrcode
 from dotenv import load_dotenv
@@ -13,38 +14,48 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.tl.types import MessageEntityMentionName
 from pathlib import Path
 from memory import (
+    apply_participant_summary,
     append_chat_history,
     build_author_label,
     build_model_prompt,
+    build_participant_summary_prompt,
+    collect_participant_message,
+    continues_bot_dialogue,
     format_chat_context,
     load_participant_memory,
     load_recent_chat_history,
+    next_participant_batch,
+    parse_bot_reply,
     remember_participant,
     save_participant_memory,
 )
+
 load_dotenv()
 
-# =========================
-# CONFIG
-# =========================
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@").lower()  #
 RANDOM_REPLY_CHANCE = float(os.getenv("RANDOM_REPLY_CHANCE", "0.3"))
+REPLY_DEBOUNCE_SECONDS = float(os.getenv("REPLY_DEBOUNCE_SECONDS", "5"))
 PARTICIPANT_MEMORY_FILE = Path(os.getenv("PARTICIPANT_MEMORY_FILE", "data/participant_memory.json"))
 CHAT_HISTORY_DIR = Path(os.getenv("CHAT_HISTORY_DIR", "data/chat_history"))
-CHAT_CONTEXT_MESSAGES = 20
+CHAT_CONTEXT_MESSAGES = 10
+PARTICIPANT_BATCH_SIZE = 10
 HISTORY_SNAPSHOT_FILE = Path("history.txt")
+MODEL_LOG_FILE = Path(os.getenv("MODEL_LOG_FILE", "data/model.log"))
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+SYSTEM_PROMPT_FILEPATH = os.getenv("SYSTEM_PROMPT", "").strip()
 
 GEMENI_MODEL = "models/gemini-3.5-flash-lite"
+MEMORY_MODEL = os.getenv("MEMORY_MODEL", "models/gemini-2.5-flash-lite")
 
 if not API_ID or not API_HASH or not GOOGLE_API_KEY:
     raise RuntimeError("Отсутствуют API_ID, API_HASH или GOOGLE_API_KEY в .env")
 
 def load_system_prompt_from_env() -> str:
-    prompt_file = os.getenv("SYSTEM_PROMPT_FILE", "prompt.txt").strip()
+    prompt_file = SYSTEM_PROMPT_FILEPATH
     path = Path(prompt_file)
+    #print(path)
     if not path.exists():
         raise RuntimeError(f"SYSTEM_PROMPT_FILE указывает на несуществующий файл: {prompt_file}")
     prompt = path.read_text(encoding="utf-8").strip()
@@ -52,6 +63,7 @@ def load_system_prompt_from_env() -> str:
         raise RuntimeError(f"Файл промпта пуст: {prompt_file}")
     return prompt
 SYSTEM_PROMPT = load_system_prompt_from_env()
+#print(SYSTEM_PROMPT)
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
@@ -68,16 +80,55 @@ model = genai.GenerativeModel(
     safety_settings=safety_settings
 )
 
+memory_model = genai.GenerativeModel(
+    model_name=MEMORY_MODEL,
+    safety_settings=safety_settings,
+)
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 log = logging.getLogger(__name__)
+log.info("Файл системного промпта: %s", Path(SYSTEM_PROMPT_FILEPATH).name)
+
+MODEL_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+model_log = logging.getLogger(f"{__name__}.model")
+model_log.setLevel(logging.INFO)
+model_log.propagate = False
+model_log_handler = logging.FileHandler(MODEL_LOG_FILE, encoding="utf-8")
+model_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+)
+model_log.addHandler(model_log_handler)
+
+MODEL_LOG_BORDER = "=" * 80
+MODEL_LOG_DIVIDER = "-" * 80
 
 my_message_ids = set()
 my_user_id = None
 participant_memory = load_participant_memory(PARTICIPANT_MEMORY_FILE)
+summary_tasks: dict[tuple[int, int], asyncio.Task] = {}
+pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
+
+
+class GeneratedReply(TypedDict):
+    answer: str
+    summary: str
+
+
+def log_model_payload(title: str, model_name: str, context: str, payload: str) -> None:
+    model_log.info(
+        "%s\n%s\nМодель: %s\nКонтекст: %s\n%s\n%s\n%s",
+        MODEL_LOG_BORDER,
+        title,
+        model_name,
+        context,
+        MODEL_LOG_DIVIDER,
+        payload,
+        MODEL_LOG_BORDER,
+    )
 
 
 def is_command(text: str) -> bool:
@@ -158,20 +209,79 @@ def _shorten_for_log(text: str, max_len: int = 160) -> str:
         return text
     return text[: max_len - 3] + "..."
 
-async def generate_reply(chat_id: int, user_text: str) -> str:
-    """Ask Gemini with the last 20 visible messages of this exact chat."""
+async def update_participant_summary(memory_entry: dict) -> None:
+    participant_key = (memory_entry.get("chat_id"), memory_entry.get("user_id"))
+    try:
+        while batch := next_participant_batch(memory_entry, PARTICIPANT_BATCH_SIZE):
+            prompt = build_participant_summary_prompt(memory_entry, batch)
+            context = (
+                f"сводка участника | chat_id={memory_entry.get('chat_id')} | "
+                f"user_id={memory_entry.get('user_id')}"
+            )
+            log_model_payload("ОТПРАВКА МОДЕЛИ", MEMORY_MODEL, context, prompt)
+            response = await memory_model.generate_content_async(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    temperature=0.2,
+                    max_output_tokens=500,
+                ),
+            )
+            log_model_payload("ОТВЕТ МОДЕЛИ", MEMORY_MODEL, context, response.text)
+            if not apply_participant_summary(memory_entry, batch, response.text):
+                return
+            save_participant_memory(PARTICIPANT_MEMORY_FILE, participant_memory)
+            log.info(
+                "Сводка участника обновлена chat_id=%s user_id=%s",
+                memory_entry.get("chat_id"),
+                memory_entry.get("user_id"),
+            )
+    except Exception:
+        log.exception("Не удалось обновить сводку участника user_id=%s", memory_entry.get("user_id"))
+    finally:
+        if summary_tasks.get(participant_key) is asyncio.current_task():
+            summary_tasks.pop(participant_key, None)
+
+
+def schedule_participant_summary(memory_entry: dict) -> None:
+    if not next_participant_batch(memory_entry, PARTICIPANT_BATCH_SIZE):
+        return
+    participant_key = (memory_entry.get("chat_id"), memory_entry.get("user_id"))
+    task = summary_tasks.get(participant_key)
+    if not task or task.done():
+        summary_tasks[participant_key] = asyncio.create_task(
+            update_participant_summary(memory_entry)
+        )
+
+
+async def generate_reply(chat_id: int, user_text: str, memory_entry: dict) -> tuple[str, str]:
+    """Generate the visible answer and its history summary in one request."""
     recent_history = load_recent_chat_history(
         CHAT_HISTORY_DIR, chat_id, limit=CHAT_CONTEXT_MESSAGES
     )
     HISTORY_SNAPSHOT_FILE.write_text(format_chat_context(recent_history), encoding="utf-8")
-    prompt = build_model_prompt(recent_history, user_text)
+    prompt = build_model_prompt(recent_history, user_text, memory_entry)
+    context = f"ответ в чат | chat_id={chat_id}"
     try:
-        response = await model.generate_content_async(prompt)
-        answer = response.text.strip()
+        log_model_payload(
+            "ОТПРАВКА МОДЕЛИ",
+            GEMENI_MODEL,
+            context,
+            prompt,
+        )
+        response = await model.generate_content_async(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=GeneratedReply,
+            ),
+        )
+        log_model_payload("ОТВЕТ МОДЕЛИ", GEMENI_MODEL, context, response.text)
+        return parse_bot_reply(response.text)
     except Exception:
         log.exception("Ошибка Gemini для chat_id=%s", chat_id)
-        return "🎁 Ежедневная награда"
-    return answer
+        fallback = "🎁 Ежедневная награда"
+        return fallback, fallback
+
 
 async def cmd_help(event):
     text = (
@@ -261,6 +371,57 @@ async def main():
     log.info("Успешный вход: %s (%s)", me.username, me.id)
     log.info("BOT_USERNAME=%s", BOT_USERNAME or "<empty>")
 
+    for chat_memory in participant_memory.values():
+        for memory_entry in chat_memory.values():
+            schedule_participant_summary(memory_entry)
+
+    async def reply_after_pause(event, author_label: str, memory_entry: dict) -> None:
+        reply_key = (event.chat_id, event.sender_id)
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(REPLY_DEBOUNCE_SECONDS)
+            text = (event.raw_text or "").strip()
+            user_text = await build_user_text_with_reply_context(event, text)
+            user_text = f"{author_label}: {user_text}"
+            log.info(
+                "Генерация ответа chat_id=%s msg_id=%s prompt='%s'",
+                event.chat_id,
+                event.id,
+                _shorten_for_log(user_text),
+            )
+            answer, answer_summary = await generate_reply(
+                event.chat_id, user_text, memory_entry
+            )
+            sent = await event.reply(answer)
+            my_message_ids.add(sent.id)
+            append_chat_history(
+                CHAT_HISTORY_DIR,
+                event.chat_id,
+                answer_summary,
+                "Бот",
+                sender_id=my_user_id,
+                message_id=sent.id,
+                is_bot=True,
+            )
+            log.info(
+                "Ответ отправлен chat_id=%s in_reply_to=%s sent_msg_id=%s text='%s'",
+                event.chat_id,
+                event.id,
+                sent.id,
+                _shorten_for_log(answer),
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception(
+                "Ошибка отправки ответа chat_id=%s in_reply_to=%s",
+                event.chat_id,
+                event.id,
+            )
+        finally:
+            if pending_reply_tasks.get(reply_key) is current_task:
+                pending_reply_tasks.pop(reply_key, None)
+
     @client.on(events.NewMessage(incoming=True))
     async def on_message(event):
 
@@ -280,8 +441,15 @@ async def main():
         username = getattr(sender, "username", None)
         first_name = getattr(sender, "first_name", None)
         author = username or first_name or f"id:{event.sender_id}"
+        reply_key = (event.chat_id, event.sender_id)
+        dialogue_active = continues_bot_dialogue(
+            load_recent_chat_history(CHAT_HISTORY_DIR, event.chat_id, limit=2),
+            event.sender_id,
+        )
         memory_entry = remember_participant(participant_memory, event.chat_id, sender)
+        collect_participant_message(memory_entry, text, PARTICIPANT_BATCH_SIZE)
         save_participant_memory(PARTICIPANT_MEMORY_FILE, participant_memory)
+        schedule_participant_summary(memory_entry)
         author_label = build_author_label(memory_entry, author)
         append_chat_history(
             CHAT_HISTORY_DIR,
@@ -294,6 +462,9 @@ async def main():
 
         # 1) команды
         if text.startswith("/"):
+            pending_task = pending_reply_tasks.pop(reply_key, None)
+            if pending_task:
+                pending_task.cancel()
             handled = await handle_command(event)
             if handled:
                 return
@@ -302,65 +473,37 @@ async def main():
         mention = is_mention(event, text)
         reply_to_me = await is_reply_to_me(event)
         random_hit = should_random_interject(text)
+        pending_task = pending_reply_tasks.get(reply_key)
+        dialogue_continuation = event.is_private or dialogue_active or bool(
+            pending_task and not pending_task.done()
+        )
 
-        if not (mention or reply_to_me or random_hit):
+        if not (mention or reply_to_me or random_hit or dialogue_continuation):
             log.info(
-                "Сообщение пропущено chat_id=%s msg_id=%s (mention=%s reply_to_me=%s random_hit=%s)",
+                "Сообщение пропущено chat_id=%s msg_id=%s (mention=%s reply_to_me=%s random_hit=%s dialogue=%s)",
                 event.chat_id,
                 event.id,
                 mention,
                 reply_to_me,
                 random_hit,
+                dialogue_continuation,
             )
             return
 
         log.info(
-            "Триггер ответа chat_id=%s msg_id=%s (mention=%s reply_to_me=%s random_hit=%s)",
+            "Триггер ответа chat_id=%s msg_id=%s (mention=%s reply_to_me=%s random_hit=%s dialogue=%s)",
             event.chat_id,
             event.id,
             mention,
             reply_to_me,
             random_hit,
+            dialogue_continuation,
         )
-        
-        if mention:
-            user_text = await build_user_text_with_reply_context(event, text)
-        else:
-            user_text=text
-        user_text = f"{author_label}: {user_text}"
-        log.info(
-            "Генерация ответа chat_id=%s msg_id=%s prompt='%s'",
-            event.chat_id,
-            event.id,
-            _shorten_for_log(user_text),
+        if pending_task and not pending_task.done():
+            pending_task.cancel()
+        pending_reply_tasks[reply_key] = asyncio.create_task(
+            reply_after_pause(event, author_label, memory_entry)
         )
-
-        try:
-            answer = await generate_reply(event.chat_id, user_text)
-            sent = await event.reply(answer)
-            my_message_ids.add(sent.id)
-            append_chat_history(
-                CHAT_HISTORY_DIR,
-                event.chat_id,
-                answer,
-                "Бот",
-                sender_id=my_user_id,
-                message_id=sent.id,
-                is_bot=True,
-            )
-            log.info(
-                "Ответ отправлен chat_id=%s in_reply_to=%s sent_msg_id=%s text='%s'",
-                event.chat_id,
-                event.id,
-                sent.id,
-                _shorten_for_log(answer),
-            )
-        except Exception:
-            log.exception(
-                "Ошибка отправки ответа chat_id=%s in_reply_to=%s",
-                event.chat_id,
-                event.id,
-            )
 
     log.info("Бот запущен. Слушаю сообщения...")
     await client.run_until_disconnected()
