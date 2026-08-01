@@ -3,12 +3,11 @@ import re
 import random
 import asyncio
 import logging
-from typing import TypedDict
 
 import qrcode
 from dotenv import load_dotenv
-import google.generativeai as genai 
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from google import genai
+from google.genai import types
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
 from telethon.tl.types import MessageEntityMentionName
@@ -65,25 +64,17 @@ def load_system_prompt_from_env() -> str:
 SYSTEM_PROMPT = load_system_prompt_from_env()
 #print(SYSTEM_PROMPT)
 
-genai.configure(api_key=GOOGLE_API_KEY)
+genai_client = genai.Client(api_key=GOOGLE_API_KEY)
 
-safety_settings = {
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-}
-
-model = genai.GenerativeModel(
-    model_name=GEMENI_MODEL,
-    system_instruction=SYSTEM_PROMPT,
-    safety_settings=safety_settings
-)
-
-memory_model = genai.GenerativeModel(
-    model_name=MEMORY_MODEL,
-    safety_settings=safety_settings,
-)
+safety_settings = [
+    types.SafetySetting(category=category, threshold="BLOCK_NONE")
+    for category in (
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+    )
+]
 
 
 logging.basicConfig(
@@ -113,9 +104,14 @@ summary_tasks: dict[tuple[int, int], asyncio.Task] = {}
 pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
 
-class GeneratedReply(TypedDict):
-    answer: str
-    summary: str
+GENERATED_REPLY_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "answer": {"type": "STRING"},
+        "summary": {"type": "STRING"},
+    },
+    "required": ["answer", "summary"],
+}
 
 
 def log_model_payload(title: str, model_name: str, context: str, payload: str) -> None:
@@ -219,9 +215,11 @@ async def update_participant_summary(memory_entry: dict) -> None:
                 f"user_id={memory_entry.get('user_id')}"
             )
             log_model_payload("ОТПРАВКА МОДЕЛИ", MEMORY_MODEL, context, prompt)
-            response = await memory_model.generate_content_async(
-                prompt,
-                generation_config=genai.GenerationConfig(
+            response = await genai_client.aio.models.generate_content(
+                model=MEMORY_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    safety_settings=safety_settings,
                     temperature=0.2,
                     max_output_tokens=500,
                 ),
@@ -268,11 +266,14 @@ async def generate_reply(chat_id: int, user_text: str, memory_entry: dict) -> tu
             context,
             prompt,
         )
-        response = await model.generate_content_async(
-            prompt,
-            generation_config=genai.GenerationConfig(
+        response = await genai_client.aio.models.generate_content(
+            model=GEMENI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                safety_settings=safety_settings,
                 response_mime_type="application/json",
-                response_schema=GeneratedReply,
+                response_schema=GENERATED_REPLY_SCHEMA,
             ),
         )
         log_model_payload("ОТВЕТ МОДЕЛИ", GEMENI_MODEL, context, response.text)
@@ -506,7 +507,10 @@ async def main():
         )
 
     log.info("Бот запущен. Слушаю сообщения...")
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        await genai_client.aio.aclose()
 
 
 if __name__ == "__main__":
