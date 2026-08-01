@@ -42,6 +42,7 @@ CHAT_CONTEXT_MESSAGES = 10
 PARTICIPANT_BATCH_SIZE = 10
 HISTORY_SNAPSHOT_FILE = Path("history.txt")
 MODEL_LOG_FILE = Path(os.getenv("MODEL_LOG_FILE", "data/model.log"))
+APP_LOG_FILE = Path(os.getenv("APP_LOG_FILE", "logs/bot.log"))
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 SYSTEM_PROMPT_FILEPATH = os.getenv("SYSTEM_PROMPT", "").strip()
 
@@ -81,6 +82,13 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+APP_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+app_log_handler = logging.FileHandler(APP_LOG_FILE, encoding="utf-8")
+app_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+)
+logging.getLogger().addHandler(app_log_handler)
+
 log = logging.getLogger(__name__)
 log.info("Файл системного промпта: %s", Path(SYSTEM_PROMPT_FILEPATH).name)
 
