@@ -165,8 +165,10 @@ def shorten_bot_reply(answer: str, max_length: int = 300) -> str:
     return summary[: max_length - 1].rstrip() + "…"
 
 
-def parse_bot_reply(payload: str) -> tuple[str, str]:
+def parse_bot_reply(payload: str | None) -> tuple[str, str]:
     """Validate Gemini's structured answer and cap its history summary."""
+    if not payload:
+        raise ValueError("Gemini вернул ответ без текстовой части")
     result = json.loads(payload)
     answer = result.get("answer", "").strip()
     if not answer:

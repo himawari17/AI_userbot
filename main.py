@@ -47,7 +47,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 SYSTEM_PROMPT_FILEPATH = os.getenv("SYSTEM_PROMPT", "").strip()
 
 GEMENI_MODEL = "models/gemini-3.5-flash-lite"
-MEMORY_MODEL = os.getenv("MEMORY_MODEL", "models/gemini-2.5-flash-lite")
+MEMORY_MODEL = os.getenv("MEMORY_MODEL", "models/gemini-3.1-flash-lite")
 
 if not API_ID or not API_HASH or not GOOGLE_API_KEY:
     raise RuntimeError("Отсутствуют API_ID, API_HASH или GOOGLE_API_KEY в .env")
@@ -274,18 +274,34 @@ async def generate_reply(chat_id: int, user_text: str, memory_entry: dict) -> tu
             context,
             prompt,
         )
-        response = await genai_client.aio.models.generate_content(
-            model=GEMENI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                safety_settings=safety_settings,
-                response_mime_type="application/json",
-                response_schema=GENERATED_REPLY_SCHEMA,
-            ),
-        )
-        log_model_payload("ОТВЕТ МОДЕЛИ", GEMENI_MODEL, context, response.text)
-        return parse_bot_reply(response.text)
+        attempt = 0
+        while True:
+            attempt += 1
+            response = await genai_client.aio.models.generate_content(
+                model=GEMENI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    safety_settings=safety_settings,
+                    response_mime_type="application/json",
+                    response_schema=GENERATED_REPLY_SCHEMA,
+                ),
+            )
+            if response.text:
+                log_model_payload("ОТВЕТ МОДЕЛИ", GEMENI_MODEL, context, response.text)
+                return parse_bot_reply(response.text)
+
+            candidate = response.candidates[0] if response.candidates else None
+            log.warning(
+                "Gemini вернул ответ без текста chat_id=%s attempt=%s "
+                "response_id=%s finish_reason=%s finish_message=%s",
+                chat_id,
+                attempt,
+                response.response_id,
+                getattr(candidate, "finish_reason", None),
+                getattr(candidate, "finish_message", None),
+            )
+            await asyncio.sleep(1)
     except Exception:
         log.exception("Ошибка Gemini для chat_id=%s", chat_id)
         fallback = "🎁 Ежедневная награда"
